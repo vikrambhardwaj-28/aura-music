@@ -1,35 +1,33 @@
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
-const { spawn, execFile } = require("child_process");
+const { spawn } = require("child_process");
 const ytSearch = require("yt-search");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // --------------------------------------------------
-// Search cache
+// CACHE (search 15 min yaad rahega)
 // --------------------------------------------------
 const searchCache = new Map();
-const CACHE_TTL_MS = 10 * 60 * 1000;
-const CACHE_MAX = 200;
+const CACHE_TTL = 15 * 60 * 1000;
+const CACHE_MAX = 300;
 
 function getCache(key) {
   const item = searchCache.get(key);
   if (!item) return null;
-  if (Date.now() > item.expires) {
+  if (Date.now() > item.exp) {
     searchCache.delete(key);
     return null;
   }
   return item.data;
 }
-
 function setCache(key, data) {
   if (searchCache.size >= CACHE_MAX) {
-    const first = searchCache.keys().next().value;
-    searchCache.delete(first);
+    searchCache.delete(searchCache.keys().next().value);
   }
-  searchCache.set(key, { data, expires: Date.now() + CACHE_TTL_MS });
+  searchCache.set(key, { data, exp: Date.now() + CACHE_TTL });
 }
 
 // --------------------------------------------------
@@ -37,57 +35,63 @@ function setCache(key, data) {
 // --------------------------------------------------
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(path.join(__dirname, "public"), { maxAge: "1h" }));
 
+// Keep-alive (Render sleep kam kare)
 app.get("/health", (req, res) => {
-  res.json({ ok: true, engine: "yt-dlp", time: new Date().toISOString() });
+  res.json({ ok: true, cache: searchCache.size, t: Date.now() });
 });
 
 // --------------------------------------------------
-// Search
+// FAST SEARCH (retry + cache)
 // --------------------------------------------------
+async function doSearch(query) {
+  const result = await Promise.race([
+    ytSearch({ query, pages: 1 }),
+    new Promise((_, rej) =>
+      setTimeout(() => rej(new Error("timeout")), 14000)
+    ),
+  ]);
+  return (result.videos || []).slice(0, 12).map((v) => ({
+    id: v.videoId,
+    title: v.title,
+    author: v.author?.name || "Unknown",
+    thumbnail:
+      v.thumbnail || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+    timestamp: v.timestamp || "",
+  }));
+}
+
 app.get("/search", async (req, res) => {
-  try {
-    const query = String(req.query.q || "").trim();
-    if (!query) return res.status(400).json({ error: "Search query is required" });
+  const query = String(req.query.q || "").trim();
+  if (!query) return res.status(400).json({ error: "query required" });
 
-    const cacheKey = query.toLowerCase();
-    const cached = getCache(cacheKey);
-    if (cached) {
-      res.setHeader("X-Cache", "HIT");
-      return res.json(cached);
-    }
-
-    console.log("YouTube Search:", query);
-
-    const result = await Promise.race([
-      ytSearch(query),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Search timeout")), 12000)
-      ),
-    ]);
-
-    const songs = (result.videos || []).slice(0, 12).map((video) => ({
-      id: video.videoId,
-      title: video.title,
-      author: video.author?.name || "Unknown Artist",
-      thumbnail:
-        video.thumbnail ||
-        `https://i.ytimg.com/vi/${video.videoId}/hqdefault.jpg`,
-      timestamp: video.timestamp || "",
-    }));
-
-    setCache(cacheKey, songs);
-    res.setHeader("X-Cache", "MISS");
-    res.json(songs);
-  } catch (error) {
-    console.error("Search Error:", error.message || error);
-    res.status(500).json({ error: "YouTube search failed" });
+  const key = query.toLowerCase();
+  const hit = getCache(key);
+  if (hit) {
+    res.setHeader("X-Cache", "HIT");
+    return res.json(hit);
   }
+
+  let lastErr;
+  for (let i = 0; i < 3; i++) {
+    try {
+      console.log(`Search try ${i + 1}:`, query);
+      const songs = await doSearch(query);
+      setCache(key, songs);
+      res.setHeader("X-Cache", "MISS");
+      return res.json(songs);
+    } catch (e) {
+      lastErr = e;
+      console.error("Search fail:", e.message);
+      await new Promise((r) => setTimeout(r, 400 * (i + 1)));
+    }
+  }
+  res.status(500).json({ error: "Search failed", detail: lastErr?.message });
 });
 
 // --------------------------------------------------
-// Download via yt-dlp (best audio → stream to client)
+// DOWNLOAD (yt-dlp)
 // --------------------------------------------------
 app.get("/download", handleDownload);
 app.get("/api/download", handleDownload);
@@ -102,34 +106,27 @@ function handleDownload(req, res) {
       .slice(0, 80) || "aura-song";
 
   if (!id || !/^[a-zA-Z0-9_-]{6,20}$/.test(id)) {
-    return res.status(400).json({ error: "Invalid video id" });
+    return res.status(400).json({ error: "Invalid id" });
   }
 
   const url = `https://www.youtube.com/watch?v=${id}`;
-  console.log("Download (yt-dlp):", id, title);
+  console.log("Download:", id, title);
 
-  // -f ba = best audio only
-  // -o - = write to stdout
-  // --no-playlist
+  const bin = process.env.YTDLP_PATH || "yt-dlp";
   const args = [
     "-f", "ba/bestaudio/best",
     "-o", "-",
     "--no-playlist",
     "--no-warnings",
-    "--newline",
+    "--geo-bypass",
     url,
   ];
 
-  const child = spawn("yt-dlp", args, {
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-
+  const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
   let started = false;
-  let errBuf = "";
+  let err = "";
 
-  child.stderr.on("data", (chunk) => {
-    errBuf += chunk.toString();
-  });
+  child.stderr.on("data", (c) => (err += c.toString()));
 
   child.stdout.on("data", (chunk) => {
     if (!started) {
@@ -144,25 +141,24 @@ function handleDownload(req, res) {
     res.write(chunk);
   });
 
-  child.on("error", (err) => {
-    console.error("yt-dlp spawn error:", err.message);
+  child.on("error", (e) => {
+    console.error("spawn error:", e.message);
     if (!res.headersSent) {
       res.status(503).json({
-        error:
-          "yt-dlp not found. Install: brew install yt-dlp  OR  pip3 install -U yt-dlp",
+        error: "yt-dlp missing on server. Check Render build command.",
       });
-    } else {
-      res.end();
     }
   });
 
   child.on("close", (code) => {
     if (!started) {
-      console.error("yt-dlp failed:", errBuf.slice(0, 500));
+      console.error("yt-dlp exit", code, err.slice(0, 400));
       if (!res.headersSent) {
-        res.status(500).json({
-          error: "Download failed",
-          detail: errBuf.slice(0, 300),
+        // Common on Render: YouTube blocks datacenter IP
+        res.status(502).json({
+          error:
+            "Download blocked on this server (YouTube 403). Works on localhost only.",
+          detail: err.slice(0, 200),
         });
       }
     } else {
@@ -177,22 +173,10 @@ function handleDownload(req, res) {
   });
 }
 
-// --------------------------------------------------
-// Home
-// --------------------------------------------------
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log("");
-  console.log("=================================");
-  console.log("       AURA MUSIC SERVER");
-  console.log("=================================");
-  console.log(`Website:  http://localhost:${PORT}`);
-  console.log(`Engine:   yt-dlp`);
-  console.log(`Search:   http://localhost:${PORT}/search?q=test`);
-  console.log(`Download: http://localhost:${PORT}/download?id=VIDEO_ID&title=song`);
-  console.log("=================================");
-  console.log("");
+  console.log("Aura Music on", PORT);
 });
