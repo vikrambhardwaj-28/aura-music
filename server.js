@@ -7,6 +7,18 @@ const ytSearch = require("yt-search");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Optional: YouTube captions fallback (npm i youtube-transcript)
+let lyricsHandler = null;
+try {
+  lyricsHandler = require("./lyricsHandler");
+  console.log("Lyrics handler loaded (YouTube captions OK)");
+} catch (e) {
+  console.warn(
+    "lyricsHandler missing or broken — /lyrics disabled.",
+    e.message
+  );
+}
+
 // --------------------------------------------------
 // CACHE (search 15 min yaad rahega)
 // --------------------------------------------------
@@ -39,8 +51,21 @@ app.use(express.static(path.join(__dirname, "public"), { maxAge: "1h" }));
 
 // Keep-alive (Render sleep kam kare)
 app.get("/health", (req, res) => {
-  res.json({ ok: true, cache: searchCache.size, t: Date.now() });
+  res.json({
+    ok: true,
+    cache: searchCache.size,
+    lyrics: !!lyricsHandler,
+    t: Date.now(),
+  });
 });
+
+// --------------------------------------------------
+// LYRICS (YouTube captions fallback)
+// --------------------------------------------------
+if (lyricsHandler) {
+  app.get("/lyrics", lyricsHandler);
+  app.get("/api/lyrics", lyricsHandler);
+}
 
 // --------------------------------------------------
 // FAST SEARCH (retry + cache)
@@ -114,8 +139,10 @@ function handleDownload(req, res) {
 
   const bin = process.env.YTDLP_PATH || "yt-dlp";
   const args = [
-    "-f", "ba/bestaudio/best",
-    "-o", "-",
+    "-f",
+    "ba/bestaudio/best",
+    "-o",
+    "-",
     "--no-playlist",
     "--no-warnings",
     "--geo-bypass",
@@ -154,10 +181,80 @@ function handleDownload(req, res) {
     if (!started) {
       console.error("yt-dlp exit", code, err.slice(0, 400));
       if (!res.headersSent) {
-        // Common on Render: YouTube blocks datacenter IP
         res.status(502).json({
           error:
             "Download blocked on this server (YouTube 403). Works on localhost only.",
+          detail: err.slice(0, 200),
+        });
+      }
+    } else {
+      res.end();
+    }
+  });
+
+  req.on("close", () => {
+    try {
+      child.kill("SIGTERM");
+    } catch (_) {}
+  });
+}
+
+// --------------------------------------------------
+// STREAM (background play on phone)
+// --------------------------------------------------
+app.get("/stream", handleStream);
+app.get("/api/stream", handleStream);
+
+function handleStream(req, res) {
+  const id = String(req.query.id || "").trim();
+  if (!id || !/^[a-zA-Z0-9_-]{6,20}$/.test(id)) {
+    return res.status(400).json({ error: "Invalid id" });
+  }
+
+  const url = `https://www.youtube.com/watch?v=${id}`;
+  console.log("Stream:", id);
+
+  const bin = process.env.YTDLP_PATH || "yt-dlp";
+  const args = [
+    "-f",
+    "ba/bestaudio/best",
+    "-o",
+    "-",
+    "--no-playlist",
+    "--no-warnings",
+    "--geo-bypass",
+    url,
+  ];
+
+  const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+  let started = false;
+  let err = "";
+
+  child.stderr.on("data", (c) => (err += c.toString()));
+
+  child.stdout.on("data", (chunk) => {
+    if (!started) {
+      started = true;
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Content-Disposition", "inline");
+      res.setHeader("Cache-Control", "no-store");
+    }
+    res.write(chunk);
+  });
+
+  child.on("error", (e) => {
+    console.error("stream spawn error:", e.message);
+    if (!res.headersSent) {
+      res.status(503).json({ error: "yt-dlp missing on server." });
+    }
+  });
+
+  child.on("close", (code) => {
+    if (!started) {
+      console.error("stream exit", code, err.slice(0, 400));
+      if (!res.headersSent) {
+        res.status(502).json({
+          error: "Stream failed",
           detail: err.slice(0, 200),
         });
       }
@@ -179,4 +276,5 @@ app.get("/", (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Aura Music on", PORT);
+  console.log("Routes: /search /stream /download /lyrics /health");
 });
